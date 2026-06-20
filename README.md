@@ -84,6 +84,28 @@ MEM_CAP=48G /path/to/venv/bin/python3.99 my_pipeline.py
 | `MEM_CAP`  | `48G`   | Hard ceiling (`MemoryMax`). Activation switch; unset ⇒ pass-through.     |
 | `MEM_HIGH` | `40G`   | Optional soft ceiling (`MemoryHigh`): throttle + reclaim before the kill.|
 
+### Preflight memory check
+
+When `MEM_CAP` is set, the wrapper checks **before launching** that the system
+can actually supply that much, and aborts (exit code `75`, *EX_TEMPFAIL*) if it
+can't. This complements the cgroup cap: the cap bounds only *this* job's memory,
+so on its own it can't stop the machine being driven OOM by this job plus
+everything already resident. The preflight refuses to even start in that case:
+
+```console
+$ MEM_CAP=48G .../python3.99 train.py
+python-capped.sh: refusing to launch — available memory 46.0 GiB is below MEM_CAP (48.0 GiB).
+  (MemAvailable 46.0 GiB incl. reclaimable cache; MemFree 29.0 GiB.) Free some memory and retry.
+```
+
+The decision uses **`MemAvailable`** — the kernel's estimate of what's
+allocatable for a new task, *including* reclaimable buffers/caches (the
+"available" column in `free`). To instead require that much *unused* RAM and
+ignore reclaimable cache (the more conservative bound), switch the marked
+comparison line in the preflight block from `avail_bytes` to `free_bytes` (i.e.
+use `MemFree`). A percentage `MEM_CAP` (e.g. `50%`) is evaluated against total
+RAM, matching systemd.
+
 ### PyCharm
 
 1. **Settings → Project → Python Interpreter → Add → System Interpreter**, and

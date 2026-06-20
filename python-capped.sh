@@ -24,6 +24,12 @@
 #                       kernel throttles and reclaims aggressively as an early
 #                       brake, before the hard kill at MEM_CAP.
 #
+# Preflight: when MEM_CAP is set, the launch is refused up-front (exit 75) if
+# available memory right now is below MEM_CAP. The cgroup cap bounds only this
+# job, so it can't stop the box being driven OOM by this job plus what's
+# already resident; this guard does. The decision uses MemAvailable (counts
+# reclaimable cache as headroom); see the preflight block to switch to MemFree.
+#
 # PyCharm: set this script as the project interpreter, then add `MEM_CAP=48G`
 # to the run/debug configuration's Environment variables. Only those runs are
 # capped. The debugger works unchanged: a --user --scope adds no PID/network/
@@ -67,7 +73,47 @@ if [ -z "${MEM_CAP:-}" ]; then
     exec "$real" "$@"
 fi
 
-# --- cap requested: launch inside a transient memory-limited scope ----------
+# --- cap requested: preflight on currently-available memory ----------------
+# The cgroup cap bounds only our own usage; it does nothing about the box being
+# driven OOM by this job plus everything else already resident. So if available
+# memory is already below the ceiling we'd grant ourselves, bail rather than
+# risk a system-wide squeeze. MemAvailable is used (reclaimable cache counts as
+# headroom); switch `avail_bytes` to `free_bytes` at the marked line to instead
+# require that much *unused* RAM, ignoring reclaimable cache.
+preflight_bytes() {           # systemd-style size (48G / 512M / 50% / bytes) -> bytes
+    v=$1
+    case "$v" in
+        *%)     t=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo); [ -n "$t" ] || return 1
+                echo $(( t * 1024 * ${v%\%} / 100 )) ;;
+        *[Kk])  echo $(( ${v%?} * 1024 )) ;;
+        *[Mm])  echo $(( ${v%?} * 1024 * 1024 )) ;;
+        *[Gg])  echo $(( ${v%?} * 1024 * 1024 * 1024 )) ;;
+        *[Tt])  echo $(( ${v%?} * 1024 * 1024 * 1024 * 1024 )) ;;
+        *[0-9]) echo "$v" ;;
+        *)      return 1 ;;
+    esac
+}
+human() { awk -v b="$1" 'BEGIN{ printf "%.1f GiB", b/1073741824 }'; }
+
+if cap_bytes=$(preflight_bytes "$MEM_CAP"); then
+    free_kb=$(awk '/^MemFree:/{print $2; exit}' /proc/meminfo)
+    avail_kb=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo)
+    if [ -n "${free_kb:-}" ]; then
+        free_bytes=$(( free_kb * 1024 ))
+        avail_bytes=$(( ${avail_kb:-0} * 1024 ))
+        if [ "$avail_bytes" -lt "$cap_bytes" ]; then  # <-- decision metric (avail_bytes | free_bytes)
+            echo "python-capped.sh: refusing to launch — available memory $(human "$avail_bytes") is below MEM_CAP ($(human "$cap_bytes"))." >&2
+            echo "  (MemAvailable $(human "$avail_bytes") incl. reclaimable cache; MemFree $(human "$free_bytes").) Free some memory and retry." >&2
+            exit 75   # EX_TEMPFAIL: the job is fine, there just isn't RAM right now
+        fi
+    else
+        echo "python-capped.sh: /proc/meminfo unreadable; skipping preflight" >&2
+    fi
+else
+    echo "python-capped.sh: could not parse MEM_CAP='$MEM_CAP' for preflight; skipping" >&2
+fi
+
+# --- launch inside a transient memory-limited scope -------------------------
 if ! command -v systemd-run >/dev/null 2>&1; then
     echo "python-capped.sh: MEM_CAP set but systemd-run not found; running uncapped" >&2
     exec "$real" "$@"
